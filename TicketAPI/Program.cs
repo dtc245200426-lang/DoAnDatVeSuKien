@@ -1,4 +1,7 @@
+using System.Text;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using RabbitMQ.Client;
 using TicketAPI;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -16,7 +19,7 @@ app.MapGet("/api/events", async (AppDbContext db) =>
     return Results.Ok(events);
 });
 
-// 2. Gửi yêu cầu đặt vé mới (Trạng thái ban đầu là Pending)
+// 2. Gửi yêu cầu đặt vé mới -> Lưu Pending -> Gửi message vào RabbitMQ
 app.MapPost("/api/bookings", async (BookingRequest request, AppDbContext db) =>
 {
     var ev = await db.Events.FindAsync(request.EventId);
@@ -41,6 +44,26 @@ app.MapPost("/api/bookings", async (BookingRequest request, AppDbContext db) =>
     db.Bookings.Add(booking);
     await db.SaveChangesAsync();
 
+    // Bắn tin nhắn chứa thông tin đơn đặt vé vào hàng đợi RabbitMQ
+    var factory = new ConnectionFactory { HostName = "localhost" };
+    await using var connection = await factory.CreateConnectionAsync();
+    await using var channel = await connection.CreateChannelAsync();
+
+    await channel.QueueDeclareAsync(
+        queue: "booking_queue",
+        durable: true,
+        exclusive: false,
+        autoDelete: false,
+        arguments: null);
+
+    var messagePayload = JsonSerializer.Serialize(new { BookingId = booking.Id });
+    var body = Encoding.UTF8.GetBytes(messagePayload);
+
+    await channel.BasicPublishAsync(
+        exchange: string.Empty,
+        routingKey: "booking_queue",
+        body: body);
+
     return Results.Created($"/api/bookings/{booking.Id}", booking);
 });
 
@@ -48,8 +71,8 @@ app.MapPost("/api/bookings", async (BookingRequest request, AppDbContext db) =>
 app.MapGet("/api/bookings/{id:int}", async (int id, AppDbContext db) =>
 {
     var booking = await db.Bookings.FindAsync(id);
-    return booking is not null 
-        ? Results.Ok(booking) 
+    return booking is not null
+        ? Results.Ok(booking)
         : Results.NotFound(new { Message = "Không tìm thấy đơn đặt vé." });
 });
 
@@ -62,5 +85,4 @@ app.MapGet("/api/bookings", async (AppDbContext db) =>
 
 app.Run();
 
-// Model nhận dữ liệu gửi lên khi đặt vé
 record BookingRequest(int EventId, string CustomerName, int Quantity);
